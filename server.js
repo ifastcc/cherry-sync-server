@@ -4,12 +4,16 @@ const cors = require('cors')
 const path = require('path')
 const fs = require('fs')
 const util = require('util')
+const crypto = require('crypto')
 
 // ── 配置 ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3456
 const TOKEN = process.env.SYNC_TOKEN || 'cherry-sync-default-token'
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'sync.db')
 const LOG_PATH = path.join(path.dirname(DB_PATH), 'sync.log')
+
+const DEFAULT_PAGE_LIMIT = 200
+const MAX_PAGE_LIMIT = 1000
 
 // ── 数据库与日志设置 ──────────────────────────────────────────────────
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
@@ -37,6 +41,81 @@ const db = new Database(DB_PATH)
 db.pragma('journal_mode = WAL')
 db.pragma('foreign_keys = ON')
 
+function parseClientTimestamp(value) {
+  if (value == null) return null
+  const ts = typeof value === 'number' ? value : new Date(value).getTime()
+  if (!Number.isFinite(ts) || ts <= 0) return null
+  return Math.floor(ts)
+}
+
+function sha1Hex(value) {
+  return crypto.createHash('sha1').update(value).digest('hex')
+}
+
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(value, 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
+}
+
+function clamp(value, min, max) {
+  if (value < min) return min
+  if (value > max) return max
+  return value
+}
+
+function ensureTopicColumn(columnName, definition) {
+  const columns = db.prepare('PRAGMA table_info(topics)').all().map((item) => item.name)
+  if (!columns.includes(columnName)) {
+    db.exec(`ALTER TABLE topics ADD COLUMN ${columnName} ${definition}`)
+  }
+}
+
+function ensureMetaCounterAtLeast(target) {
+  const row = db.prepare("SELECT value FROM meta WHERE key = 'change_seq'").get()
+  const current = Number(row?.value || 0)
+  if (current >= target) return current
+  db.prepare("INSERT INTO meta (key, value) VALUES ('change_seq', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(target)
+  return target
+}
+
+function backfillTopicSequenceIfNeeded() {
+  const maxSeqRow = db.prepare('SELECT MAX(seq) AS max_seq FROM topics').get()
+  const maxSeq = Number(maxSeqRow?.max_seq || 0)
+
+  db.exec('UPDATE topics SET client_updated_at = updated_at WHERE client_updated_at IS NULL OR client_updated_at <= 0')
+
+  if (maxSeq > 0) {
+    ensureMetaCounterAtLeast(maxSeq)
+    return
+  }
+
+  const topicIds = db
+    .prepare('SELECT topic_id FROM topics ORDER BY updated_at ASC, topic_id ASC')
+    .all()
+
+  if (topicIds.length === 0) {
+    ensureMetaCounterAtLeast(0)
+    return
+  }
+
+  const updateSeq = db.prepare(`
+    UPDATE topics
+    SET seq = @seq,
+        revision = CASE WHEN revision < 1 THEN 1 ELSE revision END
+    WHERE topic_id = @topic_id
+  `)
+
+  let seq = 0
+  db.transaction(() => {
+    for (const row of topicIds) {
+      seq += 1
+      updateSeq.run({ topic_id: row.topic_id, seq })
+    }
+  })()
+
+  ensureMetaCounterAtLeast(seq)
+}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS topics (
     topic_id    TEXT PRIMARY KEY,
@@ -46,45 +125,310 @@ db.exec(`
     data        TEXT NOT NULL,
     created_at  INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL,
-    deleted_at  INTEGER
+    deleted_at  INTEGER,
+    seq         INTEGER NOT NULL DEFAULT 0,
+    revision    INTEGER NOT NULL DEFAULT 0,
+    client_updated_at INTEGER NOT NULL DEFAULT 0,
+    content_hash TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+  );
+
   CREATE INDEX IF NOT EXISTS idx_topics_updated ON topics(updated_at);
   CREATE INDEX IF NOT EXISTS idx_topics_deleted ON topics(deleted_at);
+  CREATE INDEX IF NOT EXISTS idx_topics_seq ON topics(seq);
 `)
+
+ensureTopicColumn('seq', 'INTEGER NOT NULL DEFAULT 0')
+ensureTopicColumn('revision', 'INTEGER NOT NULL DEFAULT 0')
+ensureTopicColumn('client_updated_at', 'INTEGER NOT NULL DEFAULT 0')
+ensureTopicColumn('content_hash', 'TEXT')
+
+ensureMetaCounterAtLeast(0)
+backfillTopicSequenceIfNeeded()
 
 // ── Prepared Statements ───────────────────────────────────────────────
 const stmts = {
-  upsert: db.prepare(`
-    INSERT INTO topics (topic_id, name, assistant_id, assistant_name, data, created_at, updated_at, deleted_at)
-    VALUES (@topic_id, @name, @assistant_id, @assistant_name, @data, @created_at, @updated_at, NULL)
-    ON CONFLICT(topic_id) DO UPDATE SET
-      name = @name,
-      assistant_id = @assistant_id,
-      assistant_name = @assistant_name,
-      data = @data,
-      updated_at = @updated_at,
-      deleted_at = NULL
-  `),
-  softDelete: db.prepare(`
-    UPDATE topics SET deleted_at = @now, updated_at = @now WHERE topic_id = @topic_id
-  `),
-  getOne: db.prepare(`
-    SELECT topic_id, name, assistant_id, assistant_name, data, created_at, updated_at
-    FROM topics WHERE topic_id = ? AND deleted_at IS NULL
-  `),
-  listAll: db.prepare(`
-    SELECT topic_id, name, assistant_id, assistant_name, created_at, updated_at
-    FROM topics WHERE deleted_at IS NULL ORDER BY updated_at DESC
-  `),
-  changesSince: db.prepare(`
-    SELECT topic_id,
-      CASE WHEN deleted_at IS NOT NULL THEN 'delete' ELSE 'upsert' END AS op,
-      updated_at
+  getMeta: db.prepare('SELECT value FROM meta WHERE key = ?'),
+  upsertMeta: db.prepare('INSERT INTO meta (key, value) VALUES (@key, @value) ON CONFLICT(key) DO UPDATE SET value = excluded.value'),
+
+  getTopicForWrite: db.prepare(`
+    SELECT topic_id, created_at, updated_at, deleted_at, seq, revision, client_updated_at, content_hash
     FROM topics
-    WHERE updated_at > @since OR (deleted_at IS NOT NULL AND deleted_at > @since)
-    ORDER BY updated_at ASC
+    WHERE topic_id = ?
+  `),
+
+  insertTopic: db.prepare(`
+    INSERT INTO topics (
+      topic_id,
+      name,
+      assistant_id,
+      assistant_name,
+      data,
+      created_at,
+      updated_at,
+      deleted_at,
+      seq,
+      revision,
+      client_updated_at,
+      content_hash
+    )
+    VALUES (
+      @topic_id,
+      @name,
+      @assistant_id,
+      @assistant_name,
+      @data,
+      @created_at,
+      @updated_at,
+      NULL,
+      @seq,
+      @revision,
+      @client_updated_at,
+      @content_hash
+    )
+  `),
+
+  updateTopic: db.prepare(`
+    UPDATE topics
+    SET name = @name,
+        assistant_id = @assistant_id,
+        assistant_name = @assistant_name,
+        data = @data,
+        updated_at = @updated_at,
+        deleted_at = NULL,
+        seq = @seq,
+        revision = @revision,
+        client_updated_at = @client_updated_at,
+        content_hash = @content_hash
+    WHERE topic_id = @topic_id
+  `),
+
+  softDelete: db.prepare(`
+    UPDATE topics
+    SET deleted_at = @now,
+        updated_at = @now,
+        seq = @seq,
+        revision = @revision,
+        client_updated_at = @client_updated_at
+    WHERE topic_id = @topic_id
+  `),
+
+  getOne: db.prepare(`
+    SELECT topic_id, name, assistant_id, assistant_name, data, created_at, updated_at, seq, revision, client_updated_at
+    FROM topics
+    WHERE topic_id = ? AND deleted_at IS NULL
+  `),
+
+  listAll: db.prepare(`
+    SELECT topic_id, name, assistant_id, assistant_name, created_at, updated_at, seq, revision, client_updated_at
+    FROM topics
+    WHERE deleted_at IS NULL
+    ORDER BY updated_at DESC
+  `),
+
+  changesAfterCursor: db.prepare(`
+    SELECT topic_id, seq, revision, updated_at, client_updated_at, deleted_at, data
+    FROM topics
+    WHERE seq > @cursor
+    ORDER BY seq ASC
+    LIMIT @limit
   `),
 }
+
+function allocateSeq() {
+  const row = stmts.getMeta.get('change_seq')
+  const next = Number(row?.value || 0) + 1
+  stmts.upsertMeta.run({ key: 'change_seq', value: next })
+  return next
+}
+
+function applyTopicUpsert(body) {
+  if (!body || !body.topicId) {
+    return { ok: false, topicId: '', status: 'error', error: 'topicId is required' }
+  }
+
+  const now = Date.now()
+  const createdAt = parseClientTimestamp(body.createdAt) ?? now
+  const clientUpdatedAt = parseClientTimestamp(body.updatedAt) ?? now
+  const payload = JSON.stringify(body)
+  const contentHash = sha1Hex(payload)
+
+  const existing = stmts.getTopicForWrite.get(body.topicId)
+  if (existing) {
+    const existingClientUpdatedAt = Number(existing.client_updated_at || 0)
+    const existingDeleted = existing.deleted_at != null
+
+    if (existingDeleted) {
+      if (clientUpdatedAt <= existingClientUpdatedAt) {
+        return {
+          ok: true,
+          topicId: body.topicId,
+          status: 'stale',
+          seq: Number(existing.seq || 0),
+          revision: Number(existing.revision || 0),
+        }
+      }
+    } else {
+      if (clientUpdatedAt < existingClientUpdatedAt) {
+        return {
+          ok: true,
+          topicId: body.topicId,
+          status: 'stale',
+          seq: Number(existing.seq || 0),
+          revision: Number(existing.revision || 0),
+        }
+      }
+
+      if (clientUpdatedAt === existingClientUpdatedAt && contentHash === (existing.content_hash || '')) {
+        return {
+          ok: true,
+          topicId: body.topicId,
+          status: 'noop',
+          seq: Number(existing.seq || 0),
+          revision: Number(existing.revision || 0),
+        }
+      }
+    }
+
+    const seq = allocateSeq()
+    const revision = Number(existing.revision || 0) + 1
+
+    stmts.updateTopic.run({
+      topic_id: body.topicId,
+      name: body.name || '',
+      assistant_id: body.assistantId || null,
+      assistant_name: body.assistantName || null,
+      data: payload,
+      updated_at: now,
+      seq,
+      revision,
+      client_updated_at: clientUpdatedAt,
+      content_hash: contentHash,
+    })
+
+    return {
+      ok: true,
+      topicId: body.topicId,
+      status: 'applied',
+      seq,
+      revision,
+    }
+  }
+
+  const seq = allocateSeq()
+  const revision = 1
+
+  stmts.insertTopic.run({
+    topic_id: body.topicId,
+    name: body.name || '',
+    assistant_id: body.assistantId || null,
+    assistant_name: body.assistantName || null,
+    data: payload,
+    created_at: createdAt,
+    updated_at: now,
+    seq,
+    revision,
+    client_updated_at: clientUpdatedAt,
+    content_hash: contentHash,
+  })
+
+  return {
+    ok: true,
+    topicId: body.topicId,
+    status: 'applied',
+    seq,
+    revision,
+  }
+}
+
+function applyTopicDelete(topicId) {
+  if (!topicId) {
+    return { ok: false, topicId: '', status: 'error', error: 'topicId is required' }
+  }
+
+  const existing = stmts.getTopicForWrite.get(topicId)
+  if (!existing) {
+    return { ok: true, topicId, status: 'not_found' }
+  }
+
+  if (existing.deleted_at != null) {
+    return {
+      ok: true,
+      topicId,
+      status: 'noop',
+      seq: Number(existing.seq || 0),
+      revision: Number(existing.revision || 0),
+    }
+  }
+
+  const now = Date.now()
+  const seq = allocateSeq()
+  const revision = Number(existing.revision || 0) + 1
+
+  stmts.softDelete.run({
+    topic_id: topicId,
+    now,
+    seq,
+    revision,
+    client_updated_at: now,
+  })
+
+  return {
+    ok: true,
+    topicId,
+    status: 'applied',
+    seq,
+    revision,
+  }
+}
+
+function summarizeResults(results) {
+  let applied = 0
+  let noop = 0
+  let stale = 0
+  let failed = 0
+
+  for (const item of results) {
+    if (!item.ok || item.status === 'error') {
+      failed += 1
+      continue
+    }
+    if (item.status === 'applied') {
+      applied += 1
+      continue
+    }
+    if (item.status === 'noop' || item.status === 'not_found') {
+      noop += 1
+      continue
+    }
+    if (item.status === 'stale') {
+      stale += 1
+      continue
+    }
+  }
+
+  return { applied, noop, stale, failed }
+}
+
+const batchUpsert = db.transaction((topics) => {
+  const results = []
+  for (const body of topics) {
+    results.push(applyTopicUpsert(body))
+  }
+  return results
+})
+
+const batchDelete = db.transaction((topicIds) => {
+  const results = []
+  for (const topicId of topicIds) {
+    results.push(applyTopicDelete(topicId))
+  }
+  return results
+})
 
 // ── Express ───────────────────────────────────────────────────────────
 const app = express()
@@ -128,7 +472,18 @@ app.get('/api/topics/:id', (req, res) => {
   try {
     const row = stmts.getOne.get(req.params.id)
     if (!row) return res.status(404).json({ error: 'Topic not found' })
-    res.json({ ...row, data: JSON.parse(row.data) })
+    res.json({
+      topicId: row.topic_id,
+      name: row.name,
+      assistantId: row.assistant_id,
+      assistantName: row.assistant_name,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      seq: row.seq,
+      revision: row.revision,
+      clientUpdatedAt: row.client_updated_at,
+      data: JSON.parse(row.data),
+    })
   } catch (e) {
     console.error('[GET /api/topics/:id]', e)
     res.status(500).json({ error: e.message })
@@ -138,112 +493,182 @@ app.get('/api/topics/:id', (req, res) => {
 // ── POST /api/topics ── 上传/更新 Topic ─────────────────────────────
 app.post('/api/topics', (req, res) => {
   try {
-    const body = req.body
-    if (!body.topicId) return res.status(400).json({ error: 'topicId is required' })
+    const result = applyTopicUpsert(req.body)
+    if (!result.ok) {
+      return res.status(400).json(result)
+    }
 
-    const now = Date.now()
-    stmts.upsert.run({
-      topic_id: body.topicId,
-      name: body.name || '',
-      assistant_id: body.assistantId || null,
-      assistant_name: body.assistantName || null,
-      data: JSON.stringify(body),
-      created_at: body.createdAt ? new Date(body.createdAt).getTime() : now,
-      updated_at: body.updatedAt ? new Date(body.updatedAt).getTime() : now,
-    })
-
-    console.log(`[SYNC] Upserted Topic: ${body.topicId} (${body.name || '未命名'})`)
-    res.json({ ok: true, topicId: body.topicId })
+    console.log(`[SYNC] Topic ${result.topicId} -> ${result.status}`)
+    res.json(result)
   } catch (e) {
     console.error('[POST /api/topics]', e)
-    res.status(500).json({ error: e.message })
+    res.status(500).json({ ok: false, status: 'error', error: e.message })
   }
 })
 
-// ── POST /api/topics/batch ── 批量上传 Topics ───────────────────────
-const batchUpsert = db.transaction((topics) => {
-  const now = Date.now()
-  let count = 0
-  for (const body of topics) {
-    if (!body.topicId) continue
-    stmts.upsert.run({
-      topic_id: body.topicId,
-      name: body.name || '',
-      assistant_id: body.assistantId || null,
-      assistant_name: body.assistantName || null,
-      data: JSON.stringify(body),
-      created_at: body.createdAt ? new Date(body.createdAt).getTime() : now,
-      updated_at: body.updatedAt ? new Date(body.updatedAt).getTime() : now,
-    })
-    count++
-  }
-  return count
-})
-
+// ── POST /api/topics/batch ── 批量上传 Topics（逐条回执）─────────────
 app.post('/api/topics/batch', (req, res) => {
   try {
-    const { topics } = req.body
-    if (!Array.isArray(topics)) return res.status(400).json({ error: 'topics array is required' })
-    const count = batchUpsert(topics)
-    console.log(`[SYNC] Batch Upserted: ${count} topics`)
-    res.json({ ok: true, count })
+    const topics = req.body?.topics
+    if (!Array.isArray(topics)) {
+      return res.status(400).json({ ok: false, error: 'topics array is required' })
+    }
+
+    const results = batchUpsert(topics)
+    const summary = summarizeResults(results)
+    console.log(`[SYNC] Batch upsert -> applied=${summary.applied}, noop=${summary.noop}, stale=${summary.stale}, failed=${summary.failed}`)
+
+    res.json({
+      ok: summary.failed === 0,
+      ...summary,
+      total: results.length,
+      results,
+    })
   } catch (e) {
     console.error('[POST /api/topics/batch]', e)
-    res.status(500).json({ error: e.message })
+    res.status(500).json({ ok: false, error: e.message })
   }
 })
 
-// ── DELETE /api/topics/:id ── 软删除 Topic ──────────────────────────
+// ── DELETE /api/topics/:id ── 软删除 Topic（含 seq/revision）─────────
 app.delete('/api/topics/:id', (req, res) => {
   try {
-    stmts.softDelete.run({ topic_id: req.params.id, now: Date.now() })
-    console.log(`[SYNC] Deleted Topic: ${req.params.id}`)
-    res.json({ ok: true })
+    const result = applyTopicDelete(req.params.id)
+    if (!result.ok) {
+      return res.status(400).json(result)
+    }
+
+    console.log(`[SYNC] Delete ${result.topicId} -> ${result.status}`)
+    res.json(result)
   } catch (e) {
     console.error('[DELETE /api/topics/:id]', e)
-    res.status(500).json({ error: e.message })
+    res.status(500).json({ ok: false, status: 'error', error: e.message })
   }
 })
 
-// ── GET /api/sync?since=<timestamp> ── 增量变更查询 ─────────────────
+// ── POST /api/topics/delete-batch ── 批量删除 Topic（逐条回执）────────
+app.post('/api/topics/delete-batch', (req, res) => {
+  try {
+    const topicIds = req.body?.topicIds
+    if (!Array.isArray(topicIds)) {
+      return res.status(400).json({ ok: false, error: 'topicIds array is required' })
+    }
+
+    const ids = topicIds.map((item) => String(item || '').trim()).filter(Boolean)
+    const results = batchDelete(ids)
+    const summary = summarizeResults(results)
+    console.log(`[SYNC] Batch delete -> applied=${summary.applied}, noop=${summary.noop}, failed=${summary.failed}`)
+
+    res.json({
+      ok: summary.failed === 0,
+      ...summary,
+      total: results.length,
+      results,
+    })
+  } catch (e) {
+    console.error('[POST /api/topics/delete-batch]', e)
+    res.status(500).json({ ok: false, error: e.message })
+  }
+})
+
+// ── GET /api/sync/changes?cursor=<seq>&limit=<n>&includePayload=1 ──
+app.get('/api/sync/changes', (req, res) => {
+  try {
+    const cursor = parsePositiveInt(req.query.cursor, 0)
+    const limit = clamp(parsePositiveInt(req.query.limit, DEFAULT_PAGE_LIMIT), 1, MAX_PAGE_LIMIT)
+    const includePayload = req.query.includePayload !== '0'
+
+    const rows = stmts.changesAfterCursor.all({
+      cursor,
+      limit: limit + 1,
+    })
+
+    const hasMore = rows.length > limit
+    const pageRows = hasMore ? rows.slice(0, limit) : rows
+
+    const items = pageRows.map((row) => {
+      const op = row.deleted_at != null ? 'delete' : 'upsert'
+      const entry = {
+        seq: Number(row.seq || 0),
+        topicId: row.topic_id,
+        op,
+        revision: Number(row.revision || 0),
+        updatedAt: Number(row.updated_at || 0),
+        clientUpdatedAt: Number(row.client_updated_at || 0),
+      }
+
+      if (includePayload && op === 'upsert') {
+        return {
+          ...entry,
+          topic: JSON.parse(row.data),
+        }
+      }
+
+      return entry
+    })
+
+    const nextCursor = items.length > 0 ? items[items.length - 1].seq : cursor
+
+    res.json({
+      serverTime: Date.now(),
+      cursor,
+      nextCursor,
+      hasMore,
+      totalChanges: items.length,
+      items,
+    })
+  } catch (e) {
+    console.error('[GET /api/sync/changes]', e)
+    res.status(500).json({ ok: false, error: e.message })
+  }
+})
+
+// ── GET /api/sync?since=<cursor> ── 兼容旧接口（仅返回 ID）─────────────
 app.get('/api/sync', (req, res) => {
   try {
-    const since = parseInt(req.query.since) || 0
-    const changes = stmts.changesSince.all({ since })
+    const since = parsePositiveInt(req.query.since, 0)
+    const rows = stmts.changesAfterCursor.all({ cursor: since, limit: MAX_PAGE_LIMIT + 1 })
 
     const upserts = []
     const deletes = []
-    for (const c of changes) {
-      if (c.op === 'delete') deletes.push(c.topic_id)
-      else upserts.push(c.topic_id)
+    let lastSeq = since
+
+    for (const row of rows) {
+      lastSeq = Number(row.seq || lastSeq)
+      if (row.deleted_at != null) deletes.push(row.topic_id)
+      else upserts.push(row.topic_id)
     }
 
     res.json({
       serverTime: Date.now(),
       since,
+      nextCursor: lastSeq,
       upserts,
       deletes,
-      totalChanges: changes.length,
+      totalChanges: rows.length,
     })
   } catch (e) {
     console.error('[GET /api/sync]', e)
-    res.status(500).json({ error: e.message })
+    res.status(500).json({ ok: false, error: e.message })
   }
 })
 
 // ── 健康检查 ────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   const count = db.prepare('SELECT COUNT(*) as count FROM topics WHERE deleted_at IS NULL').get()
-  res.json({ status: 'ok', topics: count.count, uptime: process.uptime() })
+  const changeSeq = Number(stmts.getMeta.get('change_seq')?.value || 0)
+  res.json({ status: 'ok', topics: count.count, changeSeq, uptime: process.uptime() })
 })
 
 // ── 启动 ────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   const count = db.prepare('SELECT COUNT(*) as count FROM topics WHERE deleted_at IS NULL').get()
+  const changeSeq = Number(stmts.getMeta.get('change_seq')?.value || 0)
   console.log(`🍒 Cherry Sync Server listening on http://localhost:${PORT}`)
   console.log(`   Database: ${DB_PATH}`)
   console.log(`   Topics: ${count.count}`)
-  console.log(`   Token: ${TOKEN.slice(0, 8)}...`)
+  console.log(`   ChangeSeq: ${changeSeq}`)
+  console.log('   Token configured: yes')
 })
 
 process.on('SIGINT', () => {
