@@ -8,10 +8,45 @@ Cherry Studio 增量同步服务端。
 # 设置环境变量（可选，有默认值）
 export SYNC_TOKEN="your-secret-token"
 export PORT=3456
+export SYNC_BODY_LIMIT=500mb
 
 
 node server.js
 ```
+
+## 反向代理与 413（Request Entity Too Large）
+
+如果 Cherry Studio 日志出现：
+
+- `POST /api/topics/batch failed: 413`
+- 响应体含 `nginx/1.24.0` 或 `Request Entity Too Large`
+
+通常是 Nginx 的请求体限制过小（默认约 1MB），需要在对应 `server` 或 `location` 中调大：
+
+```nginx
+server {
+    listen 2053 ssl;
+    server_name your.domain.com;
+
+    client_max_body_size 500m; # 建议 >= Node 端 JSON limit
+
+    location / {
+        proxy_pass http://127.0.0.1:3456;
+    }
+}
+```
+
+修改后执行：
+
+```bash
+nginx -t
+systemctl reload nginx
+```
+
+注意：
+
+- 本服务默认 `express.json` 限制为 `500mb`，可通过 `SYNC_BODY_LIMIT` 调整。
+- 建议 Nginx `client_max_body_size` 与其保持一致或更高（例如 `500m`），避免代理层先拦截。
 
 ## API
 
