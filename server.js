@@ -57,6 +57,31 @@ function parsePositiveInt(value, fallback) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
 }
 
+function parseOptionalPositiveInt(value) {
+  if (value == null || value === '') return null
+  const parsed = Number.parseInt(String(value), 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null
+}
+
+function parseBoolean(value, fallback = false) {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  if (typeof value !== 'string') return fallback
+  const normalized = value.trim().toLowerCase()
+  if (normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on') return true
+  if (normalized === '0' || normalized === 'false' || normalized === 'no' || normalized === 'off') return false
+  return fallback
+}
+
+function isRecord(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function headerFirst(value) {
+  if (Array.isArray(value)) return value[0]
+  return value
+}
+
 function clamp(value, min, max) {
   if (value < min) return min
   if (value > max) return max
@@ -246,62 +271,130 @@ function allocateSeq() {
   return next
 }
 
-function applyTopicUpsert(body) {
-  if (!body || !body.topicId) {
+function getRequestWriteOptions(req) {
+  const requestMeta = isRecord(req?.body?.syncMeta) ? req.body.syncMeta : null
+  const headerForce = parseBoolean(headerFirst(req?.headers?.['x-sync-force']), false)
+  const headerExpectedRevision = parseOptionalPositiveInt(headerFirst(req?.headers?.['x-sync-if-revision']))
+  const bodyForce = requestMeta?.force === true || req?.body?.force === true
+  const bodyExpectedRevision =
+    parseOptionalPositiveInt(requestMeta?.expectedRevision) ??
+    parseOptionalPositiveInt(req?.body?.expectedRevision)
+
+  return {
+    force: bodyForce || headerForce,
+    expectedRevision: bodyExpectedRevision ?? headerExpectedRevision
+  }
+}
+
+function getWriteOptionsFromPayload(payload, fallbackOptions = {}) {
+  const payloadMeta = isRecord(payload?.syncMeta) ? payload.syncMeta : null
+  const payloadForce = payloadMeta?.force === true || payload?.force === true
+  const payloadExpectedRevision =
+    parseOptionalPositiveInt(payloadMeta?.expectedRevision) ??
+    parseOptionalPositiveInt(payload?.expectedRevision)
+
+  return {
+    force: payloadForce || fallbackOptions.force === true,
+    expectedRevision: payloadExpectedRevision ?? fallbackOptions.expectedRevision ?? null
+  }
+}
+
+function sanitizeTopicPayload(body) {
+  if (!isRecord(body)) return body
+  const topic = { ...body }
+  delete topic.force
+  delete topic.expectedRevision
+  delete topic.syncMeta
+  return topic
+}
+
+function buildConflictResult(topicId, existing, reason = 'revision_mismatch') {
+  return {
+    ok: true,
+    topicId,
+    status: 'conflict',
+    error: reason,
+    seq: Number(existing.seq || 0),
+    revision: Number(existing.revision || 0),
+    serverUpdatedAt: Number(existing.updated_at || 0),
+    serverClientUpdatedAt: Number(existing.client_updated_at || 0),
+    serverDeletedAt: existing.deleted_at == null ? null : Number(existing.deleted_at || 0)
+  }
+}
+
+function applyTopicUpsert(body, requestOptions = {}) {
+  const writeOptions = getWriteOptionsFromPayload(body, requestOptions)
+  const topic = sanitizeTopicPayload(body)
+
+  if (!topic || !topic.topicId) {
     return { ok: false, topicId: '', status: 'error', error: 'topicId is required' }
   }
 
+  const topicId = String(topic.topicId)
   const now = Date.now()
-  const createdAt = parseClientTimestamp(body.createdAt) ?? now
-  const clientUpdatedAt = parseClientTimestamp(body.updatedAt) ?? now
-  const payload = JSON.stringify(body)
+  const createdAt = parseClientTimestamp(topic.createdAt) ?? now
+  const clientUpdatedAt = parseClientTimestamp(topic.updatedAt) ?? now
+  const payload = JSON.stringify(topic)
   const contentHash = sha1Hex(payload)
 
-  const existing = stmts.getTopicForWrite.get(body.topicId)
+  const existing = stmts.getTopicForWrite.get(topicId)
   if (existing) {
+    const existingRevision = Number(existing.revision || 0)
     const existingClientUpdatedAt = Number(existing.client_updated_at || 0)
     const existingDeleted = existing.deleted_at != null
 
-    if (existingDeleted) {
+    if (
+      writeOptions.expectedRevision != null &&
+      writeOptions.expectedRevision !== existingRevision &&
+      !writeOptions.force
+    ) {
+      return buildConflictResult(topicId, existing, 'revision_mismatch')
+    }
+
+    if (!writeOptions.force && existingDeleted) {
       if (clientUpdatedAt <= existingClientUpdatedAt) {
         return {
           ok: true,
-          topicId: body.topicId,
+          topicId,
           status: 'stale',
           seq: Number(existing.seq || 0),
-          revision: Number(existing.revision || 0),
+          revision: existingRevision,
         }
       }
-    } else {
+    } else if (!writeOptions.force) {
       if (clientUpdatedAt < existingClientUpdatedAt) {
         return {
           ok: true,
-          topicId: body.topicId,
+          topicId,
           status: 'stale',
           seq: Number(existing.seq || 0),
-          revision: Number(existing.revision || 0),
-        }
-      }
-
-      if (clientUpdatedAt === existingClientUpdatedAt && contentHash === (existing.content_hash || '')) {
-        return {
-          ok: true,
-          topicId: body.topicId,
-          status: 'noop',
-          seq: Number(existing.seq || 0),
-          revision: Number(existing.revision || 0),
+          revision: existingRevision,
         }
       }
     }
 
+    if (
+      !existingDeleted &&
+      clientUpdatedAt === existingClientUpdatedAt &&
+      contentHash === (existing.content_hash || '')
+    ) {
+      return {
+        ok: true,
+        topicId,
+        status: 'noop',
+        seq: Number(existing.seq || 0),
+        revision: existingRevision,
+      }
+    }
+
     const seq = allocateSeq()
-    const revision = Number(existing.revision || 0) + 1
+    const revision = existingRevision + 1
 
     stmts.updateTopic.run({
-      topic_id: body.topicId,
-      name: body.name || '',
-      assistant_id: body.assistantId || null,
-      assistant_name: body.assistantName || null,
+      topic_id: topicId,
+      name: topic.name || '',
+      assistant_id: topic.assistantId || null,
+      assistant_name: topic.assistantName || null,
       data: payload,
       updated_at: now,
       seq,
@@ -312,10 +405,21 @@ function applyTopicUpsert(body) {
 
     return {
       ok: true,
-      topicId: body.topicId,
+      topicId,
       status: 'applied',
       seq,
       revision,
+    }
+  }
+
+  if (writeOptions.expectedRevision != null && writeOptions.expectedRevision !== 0 && !writeOptions.force) {
+    return {
+      ok: true,
+      topicId,
+      status: 'conflict',
+      error: 'topic_not_found_for_expected_revision',
+      seq: 0,
+      revision: 0
     }
   }
 
@@ -323,10 +427,10 @@ function applyTopicUpsert(body) {
   const revision = 1
 
   stmts.insertTopic.run({
-    topic_id: body.topicId,
-    name: body.name || '',
-    assistant_id: body.assistantId || null,
-    assistant_name: body.assistantName || null,
+    topic_id: topicId,
+    name: topic.name || '',
+    assistant_id: topic.assistantId || null,
+    assistant_name: topic.assistantName || null,
     data: payload,
     created_at: createdAt,
     updated_at: now,
@@ -338,48 +442,69 @@ function applyTopicUpsert(body) {
 
   return {
     ok: true,
-    topicId: body.topicId,
+    topicId,
     status: 'applied',
     seq,
     revision,
   }
 }
 
-function applyTopicDelete(topicId) {
+function applyTopicDelete(topicId, requestOptions = {}) {
   if (!topicId) {
     return { ok: false, topicId: '', status: 'error', error: 'topicId is required' }
   }
 
+  const normalizedTopicId = String(topicId)
   const existing = stmts.getTopicForWrite.get(topicId)
   if (!existing) {
-    return { ok: true, topicId, status: 'not_found' }
+    if (requestOptions.expectedRevision != null && !requestOptions.force) {
+      return {
+        ok: true,
+        topicId: normalizedTopicId,
+        status: 'conflict',
+        error: 'topic_not_found_for_expected_revision',
+        seq: 0,
+        revision: 0
+      }
+    }
+    return { ok: true, topicId: normalizedTopicId, status: 'not_found' }
+  }
+
+  const existingRevision = Number(existing.revision || 0)
+  if (
+    requestOptions.expectedRevision != null &&
+    requestOptions.expectedRevision !== existingRevision &&
+    !requestOptions.force
+  ) {
+    return buildConflictResult(normalizedTopicId, existing, 'revision_mismatch')
   }
 
   if (existing.deleted_at != null) {
     return {
       ok: true,
-      topicId,
+      topicId: normalizedTopicId,
       status: 'noop',
       seq: Number(existing.seq || 0),
-      revision: Number(existing.revision || 0),
+      revision: existingRevision,
     }
   }
 
   const now = Date.now()
   const seq = allocateSeq()
-  const revision = Number(existing.revision || 0) + 1
+  const revision = existingRevision + 1
+  const clientUpdatedAt = parseClientTimestamp(requestOptions.clientUpdatedAt) ?? now
 
   stmts.softDelete.run({
-    topic_id: topicId,
+    topic_id: normalizedTopicId,
     now,
     seq,
     revision,
-    client_updated_at: now,
+    client_updated_at: clientUpdatedAt,
   })
 
   return {
     ok: true,
-    topicId,
+    topicId: normalizedTopicId,
     status: 'applied',
     seq,
     revision,
@@ -390,6 +515,7 @@ function summarizeResults(results) {
   let applied = 0
   let noop = 0
   let stale = 0
+  let conflict = 0
   let failed = 0
 
   for (const item of results) {
@@ -409,23 +535,28 @@ function summarizeResults(results) {
       stale += 1
       continue
     }
+
+    if (item.status === 'conflict') {
+      conflict += 1
+      continue
+    }
   }
 
-  return { applied, noop, stale, failed }
+  return { applied, noop, stale, conflict, failed }
 }
 
-const batchUpsert = db.transaction((topics) => {
+const batchUpsert = db.transaction((topics, requestOptions = {}) => {
   const results = []
   for (const body of topics) {
-    results.push(applyTopicUpsert(body))
+    results.push(applyTopicUpsert(body, requestOptions))
   }
   return results
 })
 
-const batchDelete = db.transaction((topicIds) => {
+const batchDelete = db.transaction((topicIds, requestOptions = {}) => {
   const results = []
   for (const topicId of topicIds) {
-    results.push(applyTopicDelete(topicId))
+    results.push(applyTopicDelete(topicId, requestOptions))
   }
   return results
 })
@@ -490,10 +621,33 @@ app.get('/api/topics/:id', (req, res) => {
   }
 })
 
+// ── GET /api/topics/:id/revision ── 获取 Topic 当前版本元数据 ───────────
+app.get('/api/topics/:id/revision', (req, res) => {
+  try {
+    const row = stmts.getTopicForWrite.get(req.params.id)
+    if (!row) {
+      return res.status(404).json({ error: 'Topic not found' })
+    }
+
+    res.json({
+      topicId: req.params.id,
+      seq: Number(row.seq || 0),
+      revision: Number(row.revision || 0),
+      updatedAt: Number(row.updated_at || 0),
+      clientUpdatedAt: Number(row.client_updated_at || 0),
+      deletedAt: row.deleted_at == null ? null : Number(row.deleted_at || 0)
+    })
+  } catch (e) {
+    console.error('[GET /api/topics/:id/revision]', e)
+    res.status(500).json({ error: e.message })
+  }
+})
+
 // ── POST /api/topics ── 上传/更新 Topic ─────────────────────────────
 app.post('/api/topics', (req, res) => {
   try {
-    const result = applyTopicUpsert(req.body)
+    const requestOptions = getRequestWriteOptions(req)
+    const result = applyTopicUpsert(req.body, requestOptions)
     if (!result.ok) {
       return res.status(400).json(result)
     }
@@ -514,9 +668,13 @@ app.post('/api/topics/batch', (req, res) => {
       return res.status(400).json({ ok: false, error: 'topics array is required' })
     }
 
-    const results = batchUpsert(topics)
+    const requestOptions = getRequestWriteOptions(req)
+    const results = batchUpsert(topics, requestOptions)
     const summary = summarizeResults(results)
-    console.log(`[SYNC] Batch upsert -> applied=${summary.applied}, noop=${summary.noop}, stale=${summary.stale}, failed=${summary.failed}`)
+    console.log(
+      `[SYNC] Batch upsert -> applied=${summary.applied}, noop=${summary.noop}, ` +
+        `stale=${summary.stale}, conflict=${summary.conflict}, failed=${summary.failed}`
+    )
 
     res.json({
       ok: summary.failed === 0,
@@ -533,7 +691,8 @@ app.post('/api/topics/batch', (req, res) => {
 // ── DELETE /api/topics/:id ── 软删除 Topic（含 seq/revision）─────────
 app.delete('/api/topics/:id', (req, res) => {
   try {
-    const result = applyTopicDelete(req.params.id)
+    const requestOptions = getRequestWriteOptions(req)
+    const result = applyTopicDelete(req.params.id, requestOptions)
     if (!result.ok) {
       return res.status(400).json(result)
     }
@@ -555,9 +714,13 @@ app.post('/api/topics/delete-batch', (req, res) => {
     }
 
     const ids = topicIds.map((item) => String(item || '').trim()).filter(Boolean)
-    const results = batchDelete(ids)
+    const requestOptions = getRequestWriteOptions(req)
+    const results = batchDelete(ids, requestOptions)
     const summary = summarizeResults(results)
-    console.log(`[SYNC] Batch delete -> applied=${summary.applied}, noop=${summary.noop}, failed=${summary.failed}`)
+    console.log(
+      `[SYNC] Batch delete -> applied=${summary.applied}, noop=${summary.noop}, ` +
+        `conflict=${summary.conflict}, failed=${summary.failed}`
+    )
 
     res.json({
       ok: summary.failed === 0,
