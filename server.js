@@ -9,6 +9,7 @@ const crypto = require('crypto')
 // ── 配置 ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3456
 const TOKEN = process.env.SYNC_TOKEN || 'cherry-sync-default-token'
+const CORS_ORIGINS = process.env.CORS_ORIGINS || '' // 逗号分隔的白名单，留空则允许所有来源
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'sync.db')
 const LOG_PATH = path.join(path.dirname(DB_PATH), 'sync.log')
 
@@ -351,17 +352,8 @@ function applyTopicUpsert(body, requestOptions = {}) {
       return buildConflictResult(topicId, existing, 'revision_mismatch')
     }
 
-    if (!writeOptions.force && existingDeleted) {
-      if (clientUpdatedAt <= existingClientUpdatedAt) {
-        return {
-          ok: true,
-          topicId,
-          status: 'stale',
-          seq: Number(existing.seq || 0),
-          revision: existingRevision,
-        }
-      }
-    } else if (!writeOptions.force) {
+    if (!writeOptions.force) {
+      // 统一 stale 判断：无论 deleted 与否，均用 < （相等时允许覆写/复活）
       if (clientUpdatedAt < existingClientUpdatedAt) {
         return {
           ok: true,
@@ -563,7 +555,16 @@ const batchDelete = db.transaction((topicIds, requestOptions = {}) => {
 
 // ── Express ───────────────────────────────────────────────────────────
 const app = express()
-app.use(cors())
+app.use(
+  cors(
+    CORS_ORIGINS
+      ? {
+          origin: CORS_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean),
+          credentials: true
+        }
+      : undefined
+  )
+)
 app.use(express.json({ limit: process.env.SYNC_BODY_LIMIT || '500mb' }))
 
 // 请求日志拦截器
@@ -613,7 +614,8 @@ app.get('/api/topics/:id', (req, res) => {
       seq: row.seq,
       revision: row.revision,
       clientUpdatedAt: row.client_updated_at,
-      data: JSON.parse(row.data),
+      topic: JSON.parse(row.data),
+      data: JSON.parse(row.data), // deprecated: use 'topic' instead
     })
   } catch (e) {
     console.error('[GET /api/topics/:id]', e)
@@ -772,12 +774,17 @@ app.get('/api/sync/changes', (req, res) => {
 
     const nextCursor = items.length > 0 ? items[items.length - 1].seq : cursor
 
+    // 返回服务端最小可用 seq，客户端可据此检测 cursor 是否落入已 purge 的空洞
+    const oldestRow = db.prepare('SELECT MIN(seq) AS min_seq FROM topics WHERE seq > 0').get()
+    const oldestAvailableSeq = oldestRow?.min_seq != null ? Number(oldestRow.min_seq) : 0
+
     res.json({
       serverTime: Date.now(),
       cursor,
       nextCursor,
       hasMore,
       totalChanges: items.length,
+      oldestAvailableSeq,
       items,
     })
   } catch (e) {
@@ -816,11 +823,48 @@ app.get('/api/sync', (req, res) => {
   }
 })
 
+// ── 软删除清理 ─────────────────────────────────────────────────────
+const PURGE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000 // 30 天
+const PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000 // 每 24 小时执行一次
+
+const stmtPurgeDeleted = db.prepare(`
+  DELETE FROM topics
+  WHERE deleted_at IS NOT NULL AND deleted_at < ?
+`)
+
+function purgeDeletedTopics() {
+  const cutoff = Date.now() - PURGE_RETENTION_MS
+  const result = stmtPurgeDeleted.run(cutoff)
+  if (result.changes > 0) {
+    console.log(`[PURGE] Removed ${result.changes} soft-deleted topics older than 30 days`)
+  }
+  return result.changes
+}
+
+// 启动时执行一次，之后每 24 小时执行
+purgeDeletedTopics()
+setInterval(purgeDeletedTopics, PURGE_INTERVAL_MS)
+
+// ── POST /api/admin/purge ── 手动触发清理（需认证）────────────────────
+app.post('/api/admin/purge', (req, res) => {
+  try {
+    const retentionDays = parsePositiveInt(req.query.retentionDays, 30)
+    const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000
+    const result = stmtPurgeDeleted.run(cutoff)
+    console.log(`[PURGE] Manual purge: removed ${result.changes} topics (retention=${retentionDays}d)`)
+    res.json({ ok: true, purged: result.changes, retentionDays })
+  } catch (e) {
+    console.error('[POST /api/admin/purge]', e)
+    res.status(500).json({ ok: false, error: e.message })
+  }
+})
+
 // ── 健康检查 ────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   const count = db.prepare('SELECT COUNT(*) as count FROM topics WHERE deleted_at IS NULL').get()
+  const deletedCount = db.prepare('SELECT COUNT(*) as count FROM topics WHERE deleted_at IS NOT NULL').get()
   const changeSeq = Number(stmts.getMeta.get('change_seq')?.value || 0)
-  res.json({ status: 'ok', topics: count.count, changeSeq, uptime: process.uptime() })
+  res.json({ status: 'ok', topics: count.count, deletedTopics: deletedCount.count, changeSeq, uptime: process.uptime() })
 })
 
 // ── 启动 ────────────────────────────────────────────────────────────
