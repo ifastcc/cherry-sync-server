@@ -263,6 +263,8 @@ const stmts = {
     ORDER BY seq ASC
     LIMIT @limit
   `),
+
+  manifestAll: db.prepare('SELECT topic_id, revision, deleted_at FROM topics'),
 }
 
 function allocateSeq() {
@@ -732,6 +734,59 @@ app.post('/api/topics/delete-batch', (req, res) => {
     })
   } catch (e) {
     console.error('[POST /api/topics/delete-batch]', e)
+    res.status(500).json({ ok: false, error: e.message })
+  }
+})
+
+// ── GET /api/sync/manifest ── 返回全量 topic revision 清单 ──────────
+app.get('/api/sync/manifest', (req, res) => {
+  try {
+    const rows = stmts.manifestAll.all()
+    const entries = {}
+    for (const row of rows) {
+      entries[row.topic_id] = {
+        revision: Number(row.revision || 0),
+        deletedAt: row.deleted_at == null ? null : Number(row.deleted_at)
+      }
+    }
+    const changeSeq = Number(stmts.getMeta.get('change_seq')?.value || 0)
+    res.json({ changeSeq, topicCount: rows.length, entries })
+  } catch (e) {
+    console.error('[GET /api/sync/manifest]', e)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ── POST /api/topics/batch-get ── 批量拉取完整 topic 数据 ─────────────
+app.post('/api/topics/batch-get', (req, res) => {
+  try {
+    const topicIds = req.body?.topicIds
+    if (!Array.isArray(topicIds)) {
+      return res.status(400).json({ ok: false, error: 'topicIds array is required' })
+    }
+
+    const ids = topicIds.map((item) => String(item || '').trim()).filter(Boolean)
+    const topics = []
+    for (const id of ids) {
+      const row = stmts.getOne.get(id)
+      if (!row) continue
+      topics.push({
+        topicId: row.topic_id,
+        name: row.name,
+        assistantId: row.assistant_id,
+        assistantName: row.assistant_name,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        seq: row.seq,
+        revision: row.revision,
+        clientUpdatedAt: row.client_updated_at,
+        topic: JSON.parse(row.data),
+      })
+    }
+
+    res.json({ topics })
+  } catch (e) {
+    console.error('[POST /api/topics/batch-get]', e)
     res.status(500).json({ ok: false, error: e.message })
   }
 })
