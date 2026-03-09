@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
+    "upgrade:db": "node scripts/upgrade-db.js",
+    "repair:askid": "node scripts/repair-askid.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
