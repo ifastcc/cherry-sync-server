@@ -182,7 +182,7 @@ const stmts = {
   upsertMeta: db.prepare('INSERT INTO meta (key, value) VALUES (@key, @value) ON CONFLICT(key) DO UPDATE SET value = excluded.value'),
 
   getTopicForWrite: db.prepare(`
-    SELECT topic_id, created_at, updated_at, deleted_at, seq, revision, client_updated_at, content_hash
+    SELECT topic_id, data, created_at, updated_at, deleted_at, seq, revision, client_updated_at, content_hash
     FROM topics
     WHERE topic_id = ?
   `),
@@ -277,14 +277,17 @@ function allocateSeq() {
 function getRequestWriteOptions(req) {
   const requestMeta = isRecord(req?.body?.syncMeta) ? req.body.syncMeta : null
   const headerForce = parseBoolean(headerFirst(req?.headers?.['x-sync-force']), false)
+  const headerRestoreDeleted = parseBoolean(headerFirst(req?.headers?.['x-sync-restore-deleted']), false)
   const headerExpectedRevision = parseOptionalPositiveInt(headerFirst(req?.headers?.['x-sync-if-revision']))
   const bodyForce = requestMeta?.force === true || req?.body?.force === true
+  const bodyRestoreDeleted = requestMeta?.restoreDeleted === true || req?.body?.restoreDeleted === true
   const bodyExpectedRevision =
     parseOptionalPositiveInt(requestMeta?.expectedRevision) ??
     parseOptionalPositiveInt(req?.body?.expectedRevision)
 
   return {
     force: bodyForce || headerForce,
+    restoreDeleted: bodyRestoreDeleted || headerRestoreDeleted,
     expectedRevision: bodyExpectedRevision ?? headerExpectedRevision
   }
 }
@@ -292,12 +295,14 @@ function getRequestWriteOptions(req) {
 function getWriteOptionsFromPayload(payload, fallbackOptions = {}) {
   const payloadMeta = isRecord(payload?.syncMeta) ? payload.syncMeta : null
   const payloadForce = payloadMeta?.force === true || payload?.force === true
+  const payloadRestoreDeleted = payloadMeta?.restoreDeleted === true || payload?.restoreDeleted === true
   const payloadExpectedRevision =
     parseOptionalPositiveInt(payloadMeta?.expectedRevision) ??
     parseOptionalPositiveInt(payload?.expectedRevision)
 
   return {
     force: payloadForce || fallbackOptions.force === true,
+    restoreDeleted: payloadRestoreDeleted || fallbackOptions.restoreDeleted === true,
     expectedRevision: payloadExpectedRevision ?? fallbackOptions.expectedRevision ?? null
   }
 }
@@ -306,6 +311,7 @@ function sanitizeTopicPayload(body) {
   if (!isRecord(body)) return body
   const topic = { ...body }
   delete topic.force
+  delete topic.restoreDeleted
   delete topic.expectedRevision
   delete topic.syncMeta
   return topic
@@ -345,6 +351,18 @@ function applyTopicUpsert(body, requestOptions = {}) {
     const existingRevision = Number(existing.revision || 0)
     const existingClientUpdatedAt = Number(existing.client_updated_at || 0)
     const existingDeleted = existing.deleted_at != null
+
+    if (existingDeleted && !writeOptions.restoreDeleted) {
+      return {
+        ok: true,
+        topicId,
+        status: 'tombstoned',
+        error: 'topic_deleted_restore_required',
+        seq: Number(existing.seq || 0),
+        revision: existingRevision,
+        deletedAt: Number(existing.deleted_at || 0)
+      }
+    }
 
     if (
       writeOptions.expectedRevision != null &&
@@ -443,6 +461,45 @@ function applyTopicUpsert(body, requestOptions = {}) {
   }
 }
 
+function applyTopicRestore(topicId, requestOptions = {}) {
+  if (!topicId) {
+    return { ok: false, topicId: '', status: 'error', error: 'topicId is required' }
+  }
+
+  const normalizedTopicId = String(topicId)
+  const existing = stmts.getTopicForWrite.get(normalizedTopicId)
+  if (!existing) {
+    return { ok: true, topicId: normalizedTopicId, status: 'not_found' }
+  }
+
+  if (existing.deleted_at == null) {
+    return {
+      ok: true,
+      topicId: normalizedTopicId,
+      status: 'noop',
+      seq: Number(existing.seq || 0),
+      revision: Number(existing.revision || 0)
+    }
+  }
+
+  return applyTopicUpsert(
+    {
+      ...JSON.parse(existing.data),
+      topicId: normalizedTopicId,
+      force: requestOptions.force === true,
+      restoreDeleted: true,
+      expectedRevision: requestOptions.expectedRevision ?? null,
+      updatedAt: parseClientTimestamp(requestOptions.clientUpdatedAt) ?? Date.now(),
+      syncMeta: {
+        restoreDeleted: true,
+        force: requestOptions.force === true,
+        expectedRevision: requestOptions.expectedRevision ?? null
+      }
+    },
+    { ...requestOptions, restoreDeleted: true }
+  )
+}
+
 function applyTopicDelete(topicId, requestOptions = {}) {
   if (!topicId) {
     return { ok: false, topicId: '', status: 'error', error: 'topicId is required' }
@@ -510,6 +567,7 @@ function summarizeResults(results) {
   let noop = 0
   let stale = 0
   let conflict = 0
+  let tombstoned = 0
   let failed = 0
 
   for (const item of results) {
@@ -534,9 +592,13 @@ function summarizeResults(results) {
       conflict += 1
       continue
     }
+    if (item.status === 'tombstoned') {
+      tombstoned += 1
+      continue
+    }
   }
 
-  return { applied, noop, stale, conflict, failed }
+  return { applied, noop, stale, conflict, tombstoned, failed }
 }
 
 const batchUpsert = db.transaction((topics, requestOptions = {}) => {
@@ -551,6 +613,14 @@ const batchDelete = db.transaction((topicIds, requestOptions = {}) => {
   const results = []
   for (const topicId of topicIds) {
     results.push(applyTopicDelete(topicId, requestOptions))
+  }
+  return results
+})
+
+const batchRestore = db.transaction((topicIds, requestOptions = {}) => {
+  const results = []
+  for (const topicId of topicIds) {
+    results.push(applyTopicRestore(topicId, requestOptions))
   }
   return results
 })
@@ -677,7 +747,7 @@ app.post('/api/topics/batch', (req, res) => {
     const summary = summarizeResults(results)
     console.log(
       `[SYNC] Batch upsert -> applied=${summary.applied}, noop=${summary.noop}, ` +
-        `stale=${summary.stale}, conflict=${summary.conflict}, failed=${summary.failed}`
+        `stale=${summary.stale}, conflict=${summary.conflict}, tombstoned=${summary.tombstoned}, failed=${summary.failed}`
     )
 
     res.json({
@@ -709,6 +779,23 @@ app.delete('/api/topics/:id', (req, res) => {
   }
 })
 
+// ── POST /api/topics/:id/restore ── 显式恢复已删除 Topic ──────────────
+app.post('/api/topics/:id/restore', (req, res) => {
+  try {
+    const requestOptions = getRequestWriteOptions(req)
+    const result = applyTopicRestore(req.params.id, requestOptions)
+    if (!result.ok) {
+      return res.status(400).json(result)
+    }
+
+    console.log(`[SYNC] Restore ${result.topicId} -> ${result.status}`)
+    res.json(result)
+  } catch (e) {
+    console.error('[POST /api/topics/:id/restore]', e)
+    res.status(500).json({ ok: false, status: 'error', error: e.message })
+  }
+})
+
 // ── POST /api/topics/delete-batch ── 批量删除 Topic（逐条回执）────────
 app.post('/api/topics/delete-batch', (req, res) => {
   try {
@@ -734,6 +821,35 @@ app.post('/api/topics/delete-batch', (req, res) => {
     })
   } catch (e) {
     console.error('[POST /api/topics/delete-batch]', e)
+    res.status(500).json({ ok: false, error: e.message })
+  }
+})
+
+// ── POST /api/topics/restore-batch ── 批量恢复 Topic（逐条回执）───────
+app.post('/api/topics/restore-batch', (req, res) => {
+  try {
+    const topicIds = req.body?.topicIds
+    if (!Array.isArray(topicIds)) {
+      return res.status(400).json({ ok: false, error: 'topicIds array is required' })
+    }
+
+    const ids = topicIds.map((item) => String(item || '').trim()).filter(Boolean)
+    const requestOptions = getRequestWriteOptions(req)
+    const results = batchRestore(ids, requestOptions)
+    const summary = summarizeResults(results)
+    console.log(
+      `[SYNC] Batch restore -> applied=${summary.applied}, noop=${summary.noop}, ` +
+        `conflict=${summary.conflict}, tombstoned=${summary.tombstoned}, failed=${summary.failed}`
+    )
+
+    res.json({
+      ok: summary.failed === 0,
+      ...summary,
+      total: results.length,
+      results
+    })
+  } catch (e) {
+    console.error('[POST /api/topics/restore-batch]', e)
     res.status(500).json({ ok: false, error: e.message })
   }
 })
