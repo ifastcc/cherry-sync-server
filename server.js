@@ -265,6 +265,13 @@ const stmts = {
   `),
 
   manifestAll: db.prepare('SELECT topic_id, revision, deleted_at FROM topics'),
+
+  listDeleted: db.prepare(`
+    SELECT topic_id, name, assistant_id, assistant_name, created_at, updated_at, deleted_at, revision
+    FROM topics
+    WHERE deleted_at IS NOT NULL
+    ORDER BY deleted_at DESC
+  `),
 }
 
 function allocateSeq() {
@@ -851,6 +858,27 @@ app.post('/api/topics/restore-batch', (req, res) => {
   } catch (e) {
     console.error('[POST /api/topics/restore-batch]', e)
     res.status(500).json({ ok: false, error: e.message })
+  }
+})
+
+// ── GET /api/topics/deleted ── 列出所有已删除 Topic（不含 data 正文）──
+app.get('/api/topics/deleted', (req, res) => {
+  try {
+    const rows = stmts.listDeleted.all()
+    const topics = rows.map((row) => ({
+      topicId: row.topic_id,
+      name: row.name || '',
+      assistantId: row.assistant_id || null,
+      assistantName: row.assistant_name || '',
+      createdAt: Number(row.created_at || 0),
+      updatedAt: Number(row.updated_at || 0),
+      deletedAt: Number(row.deleted_at || 0),
+      revision: Number(row.revision || 0),
+    }))
+    res.json({ topics, total: topics.length })
+  } catch (e) {
+    console.error('[GET /api/topics/deleted]', e)
+    res.status(500).json({ error: e.message })
   }
 })
 
