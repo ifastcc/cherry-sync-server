@@ -678,6 +678,28 @@ app.get('/api/topics', (req, res) => {
   }
 })
 
+// ── GET /api/topics/deleted ── 列出所有已删除 Topic（不含 data 正文）──
+// Keep this route ahead of /api/topics/:id so "deleted" is not captured as a topic id.
+app.get('/api/topics/deleted', (req, res) => {
+  try {
+    const rows = stmts.listDeleted.all()
+    const topics = rows.map((row) => ({
+      topicId: row.topic_id,
+      name: row.name || '',
+      assistantId: row.assistant_id || null,
+      assistantName: row.assistant_name || '',
+      createdAt: Number(row.created_at || 0),
+      updatedAt: Number(row.updated_at || 0),
+      deletedAt: Number(row.deleted_at || 0),
+      revision: Number(row.revision || 0),
+    }))
+    res.json({ topics, total: topics.length })
+  } catch (e) {
+    console.error('[GET /api/topics/deleted]', e)
+    res.status(500).json({ error: e.message })
+  }
+})
+
 // ── GET /api/topics/:id ── 获取单个 Topic 完整数据 ──────────────────
 app.get('/api/topics/:id', (req, res) => {
   try {
@@ -858,27 +880,6 @@ app.post('/api/topics/restore-batch', (req, res) => {
   } catch (e) {
     console.error('[POST /api/topics/restore-batch]', e)
     res.status(500).json({ ok: false, error: e.message })
-  }
-})
-
-// ── GET /api/topics/deleted ── 列出所有已删除 Topic（不含 data 正文）──
-app.get('/api/topics/deleted', (req, res) => {
-  try {
-    const rows = stmts.listDeleted.all()
-    const topics = rows.map((row) => ({
-      topicId: row.topic_id,
-      name: row.name || '',
-      assistantId: row.assistant_id || null,
-      assistantName: row.assistant_name || '',
-      createdAt: Number(row.created_at || 0),
-      updatedAt: Number(row.updated_at || 0),
-      deletedAt: Number(row.deleted_at || 0),
-      revision: Number(row.revision || 0),
-    }))
-    res.json({ topics, total: topics.length })
-  } catch (e) {
-    console.error('[GET /api/topics/deleted]', e)
-    res.status(500).json({ error: e.message })
   }
 })
 
